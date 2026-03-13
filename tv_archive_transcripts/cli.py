@@ -26,6 +26,10 @@ def main():
         help="Use yt-dlp to download video files for non-TV items (requires yt-dlp)"
     )
     parser.add_argument(
+        "--max-video-mb", type=int, default=500,
+        help="Skip video downloads larger than this size in MB (default: 500, 0=no limit)"
+    )
+    parser.add_argument(
         "--rows", type=int, default=50,
         help="Results per search page (default: 50)"
     )
@@ -46,6 +50,7 @@ def main():
         rows=args.rows,
         sort=args.sort,
         download_videos=args.download_videos,
+        max_video_mb=args.max_video_mb,
     )
 
     scraper.download_all(

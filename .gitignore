@@ -3,3 +3,10 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Downloaded media and transcript output
+*.webm
+*.mp4
+*.mkv
+*.part
+*TV archive transcripts/

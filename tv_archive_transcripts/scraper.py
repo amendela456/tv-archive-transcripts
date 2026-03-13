@@ -16,7 +16,7 @@ class ArchiveScraper:
     """Pull transcripts from the Internet Archive TV News Archive and Video collections."""
 
     def __init__(self, name, output_dir=None, rows=50, sort="date desc",
-                 download_videos=False):
+                 download_videos=False, max_video_mb=500):
         """
         Args:
             name: Name to search for (e.g. "Eli Crane").
@@ -24,12 +24,14 @@ class ArchiveScraper:
             rows: Max number of results per search page.
             sort: Sort order for results.
             download_videos: Use yt-dlp to download video files for non-TV items.
+            max_video_mb: Skip video downloads larger than this (MB). 0 = no limit.
         """
         self.name = name
         self.output_dir = output_dir or f"{name} TV archive transcripts"
         self.rows = rows
         self.sort = sort
         self.download_videos = download_videos
+        self.max_video_mb = max_video_mb
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "archive-transcripts/2.0"})
 
@@ -188,11 +190,33 @@ class ArchiveScraper:
     def _ytdlp_available():
         return shutil.which("yt-dlp") is not None
 
+    def _get_video_size_mb(self, identifier):
+        """Check the size of the largest video file for an item (in MB)."""
+        try:
+            meta = self.session.get(
+                f"https://archive.org/metadata/{identifier}", timeout=30
+            ).json()
+            max_size = 0
+            for f in meta.get("files", []):
+                name = f.get("name", "")
+                if name.endswith((".mp4", ".webm", ".mkv", ".avi")):
+                    max_size = max(max_size, int(f.get("size", 0)))
+            return max_size / (1024 * 1024)
+        except Exception:
+            return 0
+
     def _download_video_with_ytdlp(self, identifier, dest_dir, date, safe_title):
         """
         Download a video from archive.org using yt-dlp.
         Returns the path to the downloaded file, or None on failure.
         """
+        # Check size limit
+        if self.max_video_mb > 0:
+            size_mb = self._get_video_size_mb(identifier)
+            if size_mb > self.max_video_mb:
+                print(f"  ! Skipping video: {size_mb:.0f} MB exceeds {self.max_video_mb} MB limit")
+                return None
+
         url = f"{DETAILS_URL}/{identifier}"
         out_template = os.path.join(dest_dir, f"{date}_{safe_title}.%(ext)s")
 
@@ -208,7 +232,7 @@ class ArchiveScraper:
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,
+                timeout=1800,  # 30 minutes for large files
             )
             if result.returncode == 0:
                 # Find the downloaded file
