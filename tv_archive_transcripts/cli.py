@@ -6,7 +6,7 @@ from .scraper import ArchiveScraper
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download transcripts from Internet Archive TV News and Video collections."
+        description="Download transcripts and videos from Internet Archive TV News and Video collections."
     )
     parser.add_argument("name", help='Name to search (e.g. "Eli Crane")')
     parser.add_argument(
@@ -20,6 +20,10 @@ def main():
     parser.add_argument(
         "-s", "--source", choices=["all", "tv", "video"], default="all",
         help='Which collections to search: "all", "tv", or "video" (default: all)'
+    )
+    parser.add_argument(
+        "--download-videos", action="store_true",
+        help="Use yt-dlp to download video files for non-TV items (requires yt-dlp)"
     )
     parser.add_argument(
         "--rows", type=int, default=50,
@@ -41,6 +45,7 @@ def main():
         output_dir=args.output_dir,
         rows=args.rows,
         sort=args.sort,
+        download_videos=args.download_videos,
     )
 
     scraper.download_all(

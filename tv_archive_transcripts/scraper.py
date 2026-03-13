@@ -2,6 +2,8 @@ import os
 import re
 import time
 import json
+import subprocess
+import shutil
 import requests
 
 
@@ -13,18 +15,21 @@ DOWNLOAD_URL = "https://archive.org/download"
 class ArchiveScraper:
     """Pull transcripts from the Internet Archive TV News Archive and Video collections."""
 
-    def __init__(self, name, output_dir=None, rows=50, sort="date desc"):
+    def __init__(self, name, output_dir=None, rows=50, sort="date desc",
+                 download_videos=False):
         """
         Args:
             name: Name to search for (e.g. "Eli Crane").
             output_dir: Override output folder. Defaults to "{name} TV archive transcripts".
             rows: Max number of results per search page.
             sort: Sort order for results.
+            download_videos: Use yt-dlp to download video files for non-TV items.
         """
         self.name = name
         self.output_dir = output_dir or f"{name} TV archive transcripts"
         self.rows = rows
         self.sort = sort
+        self.download_videos = download_videos
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "archive-transcripts/2.0"})
 
@@ -113,7 +118,6 @@ class ArchiveScraper:
         pull the description and any available metadata from info.json.
         Returns (text, metadata_dict) or (None, None).
         """
-        # Find the info.json filename from metadata
         meta_resp = self.session.get(
             f"https://archive.org/metadata/{identifier}", timeout=30
         )
@@ -177,6 +181,61 @@ class ArchiveScraper:
         return "\n\n".join(parts), video_meta
 
     # ------------------------------------------------------------------
+    # yt-dlp video download
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ytdlp_available():
+        return shutil.which("yt-dlp") is not None
+
+    def _download_video_with_ytdlp(self, identifier, dest_dir, date, safe_title):
+        """
+        Download a video from archive.org using yt-dlp.
+        Returns the path to the downloaded file, or None on failure.
+        """
+        url = f"{DETAILS_URL}/{identifier}"
+        out_template = os.path.join(dest_dir, f"{date}_{safe_title}.%(ext)s")
+
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "-o", out_template,
+            url,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode == 0:
+                # Find the downloaded file
+                for line in result.stdout.splitlines():
+                    if "Destination:" in line:
+                        path = line.split("Destination:", 1)[1].strip()
+                        return path
+                    if "has already been downloaded" in line:
+                        return "(already exists)"
+                # Fallback: look for the file by glob
+                import glob
+                pattern = os.path.join(dest_dir, f"{date}_{safe_title}.*")
+                matches = [m for m in glob.glob(pattern) if not m.endswith(".txt")]
+                if matches:
+                    return matches[0]
+            else:
+                err = result.stderr.strip().split("\n")[-1] if result.stderr else "unknown error"
+                print(f"  ! yt-dlp error: {err}")
+                return None
+        except subprocess.TimeoutExpired:
+            print(f"  ! yt-dlp timed out")
+            return None
+        except FileNotFoundError:
+            print(f"  ! yt-dlp not found")
+            return None
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -198,7 +257,7 @@ class ArchiveScraper:
 
     def download_all(self, source="all", max_results=None, delay=1.0):
         """
-        Search and download transcripts.
+        Search and download transcripts (and optionally videos).
 
         Args:
             source: "all", "tv", or "video".
@@ -212,6 +271,10 @@ class ArchiveScraper:
         video_dir = os.path.join(self.output_dir, "Video")
         os.makedirs(tv_dir, exist_ok=True)
         os.makedirs(video_dir, exist_ok=True)
+
+        if self.download_videos and not self._ytdlp_available():
+            print("WARNING: --download-videos requested but yt-dlp is not installed.")
+            print("Install it with: pip install yt-dlp\n")
 
         search_fn = {
             "all": self.search_all,
@@ -245,6 +308,7 @@ class ArchiveScraper:
                 date = self._parse_date(doc.get("date"))
                 is_tv = self._is_tv(doc)
                 tag = "TV" if is_tv else "Video"
+                safe_title = self._safe_filename(title)
 
                 print(f"[{len(saved)+1}] [{tag}] {date} - {title}")
 
@@ -256,46 +320,62 @@ class ArchiveScraper:
                             print(f"  ! No caption text found, skipping.")
                             skipped += 1
                             continue
-                        content = transcript
+
+                        out_name = f"{date}_{safe_title}.txt"
+                        out_path = os.path.join(tv_dir, out_name)
+                        with open(out_path, "w", encoding="utf-8") as f:
+                            f.write(transcript)
+                        print(f"  Saved: TV/{out_name}")
+                        saved.append(out_path)
+
                     else:
+                        # Always save the description/metadata text file
                         text, meta = self._extract_video_transcript(identifier)
-                        if not text:
+                        if text:
+                            header_lines = []
+                            if meta:
+                                header_lines.append(f"Title: {meta.get('title', title)}")
+                                if meta.get("channel"):
+                                    header_lines.append(f"Channel: {meta['channel']}")
+                                if meta.get("upload_date"):
+                                    header_lines.append(f"Upload Date: {meta['upload_date']}")
+                                if meta.get("duration"):
+                                    header_lines.append(f"Duration: {meta['duration']}s")
+                                if meta.get("url"):
+                                    header_lines.append(f"URL: {meta['url']}")
+                                header_lines.append(f"Archive: https://archive.org/details/{identifier}")
+                                header_lines.append("")
+                                header_lines.append("---")
+                                header_lines.append("")
+                            content = "\n".join(header_lines) + text
+
+                            out_name = f"{date}_{safe_title}.txt"
+                            out_path = os.path.join(video_dir, out_name)
+                            with open(out_path, "w", encoding="utf-8") as f:
+                                f.write(content)
+                            print(f"  Saved: Video/{out_name}")
+                            saved.append(out_path)
+
+                        # Download the actual video file if requested
+                        if self.download_videos and self._ytdlp_available():
+                            vid_path = self._download_video_with_ytdlp(
+                                identifier, video_dir, date, safe_title
+                            )
+                            if vid_path:
+                                print(f"  Downloaded video: {os.path.basename(vid_path)}")
+                                saved.append(vid_path)
+                            else:
+                                print(f"  ! Video download failed")
+
+                        if not text and not self.download_videos:
                             print(f"  ! No description/transcript found, skipping.")
                             skipped += 1
                             continue
-                        # Build a combined file with metadata header + description
-                        header_lines = []
-                        if meta:
-                            header_lines.append(f"Title: {meta.get('title', title)}")
-                            if meta.get("channel"):
-                                header_lines.append(f"Channel: {meta['channel']}")
-                            if meta.get("upload_date"):
-                                header_lines.append(f"Upload Date: {meta['upload_date']}")
-                            if meta.get("duration"):
-                                header_lines.append(f"Duration: {meta['duration']}s")
-                            if meta.get("url"):
-                                header_lines.append(f"URL: {meta['url']}")
-                            header_lines.append(f"Archive: https://archive.org/details/{identifier}")
-                            header_lines.append("")
-                            header_lines.append("---")
-                            header_lines.append("")
-                        content = "\n".join(header_lines) + text
 
                 except requests.HTTPError as e:
                     print(f"  ! Download failed: {e}")
                     skipped += 1
                     continue
-
-                safe_title = self._safe_filename(title)
-                out_name = f"{date}_{safe_title}.txt"
-                dest_dir = tv_dir if is_tv else video_dir
-                out_path = os.path.join(dest_dir, out_name)
-
-                with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-                print(f"  Saved: {tag}/{out_name}")
-                saved.append(out_path)
 
             start += self.rows
             if start >= num_found:
