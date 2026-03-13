@@ -1,20 +1,22 @@
 import os
 import re
 import time
+import json
 import requests
 
 
 SEARCH_URL = "https://archive.org/advancedsearch.php"
 DETAILS_URL = "https://archive.org/details"
+DOWNLOAD_URL = "https://archive.org/download"
 
 
-class TVArchiveScraper:
-    """Pull closed-caption transcripts from the Internet Archive TV News Archive."""
+class ArchiveScraper:
+    """Pull transcripts from the Internet Archive TV News Archive and Video collections."""
 
     def __init__(self, name, output_dir=None, rows=50, sort="date desc"):
         """
         Args:
-            name: Politician name to search for (e.g. "Bernie Sanders").
+            name: Name to search for (e.g. "Eli Crane").
             output_dir: Override output folder. Defaults to "{name} TV archive transcripts".
             rows: Max number of results per search page.
             sort: Sort order for results.
@@ -24,13 +26,17 @@ class TVArchiveScraper:
         self.rows = rows
         self.sort = sort
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "tv-archive-transcripts/1.0"})
+        self.session.headers.update({"User-Agent": "archive-transcripts/2.0"})
 
-    def search(self, start=0):
-        """Search the TV Archive for mentions of self.name. Returns list of docs."""
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    def _search(self, query, start=0):
+        """Run an advanced search query. Returns (total_found, docs)."""
         params = {
-            "q": f'collection:tvarchive "{self.name}"',
-            "fl[]": ["identifier", "title", "date"],
+            "q": query,
+            "fl[]": ["identifier", "title", "date", "collection"],
             "sort[]": self.sort,
             "rows": self.rows,
             "start": start,
@@ -41,13 +47,41 @@ class TVArchiveScraper:
         data = resp.json()
         return data["response"]["numFound"], data["response"]["docs"]
 
-    def _extract_transcript_from_details(self, identifier):
-        """Fetch the details page and extract caption text from embedded snippets."""
+    def search_tv(self, start=0):
+        """Search TV News Archive only."""
+        return self._search(f'collection:tvarchive "{self.name}"', start)
+
+    def search_video(self, start=0):
+        """Search all video (mediatype:movies) excluding tvarchive."""
+        return self._search(
+            f'"{self.name}" mediatype:movies -collection:tvarchive', start
+        )
+
+    def search_all(self, start=0):
+        """Search all video (mediatype:movies) including TV archive."""
+        return self._search(f'"{self.name}" mediatype:movies', start)
+
+    # ------------------------------------------------------------------
+    # Classify items
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_tv(doc):
+        collections = doc.get("collection", [])
+        if isinstance(collections, str):
+            collections = [collections]
+        return "tvarchive" in collections
+
+    # ------------------------------------------------------------------
+    # TV transcript extraction (from details page caption snippets)
+    # ------------------------------------------------------------------
+
+    def _extract_tv_transcript(self, identifier):
+        """Fetch the TV details page and extract caption text from embedded snippets."""
         url = f"{DETAILS_URL}/{identifier}"
         resp = self.session.get(url, timeout=60)
         resp.raise_for_status()
 
-        # Caption text is in <div class="snipin ..."> elements
         snippets = re.findall(
             r'<div class="snipin[^"]*"[^>]*>(.*?)</div>', resp.text, re.DOTALL
         )
@@ -56,93 +90,226 @@ class TVArchiveScraper:
 
         lines = []
         for s in snippets:
-            # Clean HTML entities and extra whitespace
             text = s.strip()
             text = text.replace("&amp;", "&")
             text = text.replace("&lt;", "<")
             text = text.replace("&gt;", ">")
             text = text.replace("&quot;", '"')
             text = text.replace("&#39;", "'")
-            text = re.sub(r"<[^>]+>", "", text)  # strip any remaining tags
+            text = re.sub(r"<[^>]+>", "", text)
             text = re.sub(r"\s+", " ", text).strip()
             if text:
                 lines.append(text)
 
         return "\n\n".join(lines) if lines else None
 
+    # ------------------------------------------------------------------
+    # Video transcript extraction (info.json description + metadata)
+    # ------------------------------------------------------------------
+
+    def _extract_video_transcript(self, identifier):
+        """
+        For non-TV video items (YouTube mirrors, Twitter clips, etc.),
+        pull the description and any available metadata from info.json.
+        Returns (text, metadata_dict) or (None, None).
+        """
+        # Find the info.json filename from metadata
+        meta_resp = self.session.get(
+            f"https://archive.org/metadata/{identifier}", timeout=30
+        )
+        meta_resp.raise_for_status()
+        meta = meta_resp.json()
+        item_meta = meta.get("metadata", {})
+
+        files = meta.get("files", [])
+        info_json_name = None
+        description_name = None
+        for f in files:
+            name = f.get("name", "")
+            if name.endswith(".info.json"):
+                info_json_name = name
+            if name.endswith(".description"):
+                description_name = name
+
+        parts = []
+        video_meta = {}
+
+        # Try info.json first (richer metadata)
+        if info_json_name:
+            try:
+                resp = self.session.get(
+                    f"{DOWNLOAD_URL}/{identifier}/{info_json_name}", timeout=30
+                )
+                if resp.status_code == 200:
+                    info = resp.json()
+                    video_meta["title"] = info.get("title", "")
+                    video_meta["upload_date"] = info.get("upload_date", "")
+                    video_meta["channel"] = info.get("channel", info.get("uploader", ""))
+                    video_meta["duration"] = info.get("duration", "")
+                    video_meta["url"] = info.get("webpage_url", "")
+
+                    desc = info.get("description", "")
+                    if desc:
+                        parts.append(desc)
+            except (requests.RequestException, json.JSONDecodeError):
+                pass
+
+        # Fallback to .description file
+        if not parts and description_name:
+            try:
+                resp = self.session.get(
+                    f"{DOWNLOAD_URL}/{identifier}/{description_name}", timeout=30
+                )
+                if resp.status_code == 200 and resp.text.strip():
+                    parts.append(resp.text.strip())
+            except requests.RequestException:
+                pass
+
+        # Last resort: use the archive.org item description
+        if not parts:
+            desc = item_meta.get("description", "")
+            if desc:
+                parts.append(desc)
+
+        if not parts:
+            return None, None
+
+        return "\n\n".join(parts), video_meta
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _parse_date(date_str):
-        """Extract YYYY-MM-DD from an ISO date string."""
         if not date_str:
             return "unknown-date"
         return date_str[:10]
 
     @staticmethod
     def _safe_filename(text, max_len=120):
-        """Sanitize a string for use as a filename."""
         text = re.sub(r'[<>:"/\\|?*]', "", text)
         text = text.strip(". ")
         return text[:max_len]
 
-    def download_all(self, max_results=None, delay=1.0):
+    # ------------------------------------------------------------------
+    # Download orchestration
+    # ------------------------------------------------------------------
+
+    def download_all(self, source="all", max_results=None, delay=1.0):
         """
-        Search and download all transcripts.
+        Search and download transcripts.
 
         Args:
+            source: "all", "tv", or "video".
             max_results: Stop after this many items. None = fetch all.
             delay: Seconds to wait between requests.
 
         Returns:
-            List of paths to saved transcript files.
+            List of paths to saved files.
         """
-        os.makedirs(self.output_dir, exist_ok=True)
+        tv_dir = os.path.join(self.output_dir, "TV")
+        video_dir = os.path.join(self.output_dir, "Video")
+        os.makedirs(tv_dir, exist_ok=True)
+        os.makedirs(video_dir, exist_ok=True)
+
+        search_fn = {
+            "all": self.search_all,
+            "tv": self.search_tv,
+            "video": self.search_video,
+        }[source]
+
         saved = []
+        seen = set()
         skipped = 0
         start = 0
 
         while True:
-            num_found, docs = self.search(start=start)
+            num_found, docs = search_fn(start=start)
+            if start == 0:
+                print(f'Found {num_found} total results for "{self.name}" ({source})\n')
             if not docs:
                 break
 
             for doc in docs:
                 if max_results and len(saved) >= max_results:
-                    print(f"\nDone. {len(saved)} transcripts saved to: {self.output_dir}/")
+                    self._print_summary(saved, skipped)
                     return saved
 
                 identifier = doc["identifier"]
+                if identifier in seen:
+                    continue
+                seen.add(identifier)
+
                 title = doc.get("title", identifier)
                 date = self._parse_date(doc.get("date"))
+                is_tv = self._is_tv(doc)
+                tag = "TV" if is_tv else "Video"
 
-                print(f"[{len(saved)+1}] {date} - {title}")
+                print(f"[{len(saved)+1}] [{tag}] {date} - {title}")
 
                 time.sleep(delay)
                 try:
-                    transcript = self._extract_transcript_from_details(identifier)
+                    if is_tv:
+                        transcript = self._extract_tv_transcript(identifier)
+                        if not transcript:
+                            print(f"  ! No caption text found, skipping.")
+                            skipped += 1
+                            continue
+                        content = transcript
+                    else:
+                        text, meta = self._extract_video_transcript(identifier)
+                        if not text:
+                            print(f"  ! No description/transcript found, skipping.")
+                            skipped += 1
+                            continue
+                        # Build a combined file with metadata header + description
+                        header_lines = []
+                        if meta:
+                            header_lines.append(f"Title: {meta.get('title', title)}")
+                            if meta.get("channel"):
+                                header_lines.append(f"Channel: {meta['channel']}")
+                            if meta.get("upload_date"):
+                                header_lines.append(f"Upload Date: {meta['upload_date']}")
+                            if meta.get("duration"):
+                                header_lines.append(f"Duration: {meta['duration']}s")
+                            if meta.get("url"):
+                                header_lines.append(f"URL: {meta['url']}")
+                            header_lines.append(f"Archive: https://archive.org/details/{identifier}")
+                            header_lines.append("")
+                            header_lines.append("---")
+                            header_lines.append("")
+                        content = "\n".join(header_lines) + text
+
                 except requests.HTTPError as e:
                     print(f"  ! Download failed: {e}")
                     skipped += 1
                     continue
 
-                if not transcript:
-                    print(f"  ! No caption text found, skipping.")
-                    skipped += 1
-                    continue
-
                 safe_title = self._safe_filename(title)
                 out_name = f"{date}_{safe_title}.txt"
-                out_path = os.path.join(self.output_dir, out_name)
+                dest_dir = tv_dir if is_tv else video_dir
+                out_path = os.path.join(dest_dir, out_name)
 
                 with open(out_path, "w", encoding="utf-8") as f:
-                    f.write(transcript)
+                    f.write(content)
 
-                print(f"  Saved: {out_name}")
+                print(f"  Saved: {tag}/{out_name}")
                 saved.append(out_path)
 
             start += self.rows
             if start >= num_found:
                 break
 
-        print(f"\nDone. {len(saved)} transcripts saved, {skipped} skipped.")
-        print(f"Output: {self.output_dir}/")
+        self._print_summary(saved, skipped)
         return saved
+
+    def _print_summary(self, saved, skipped):
+        tv_count = sum(1 for p in saved if "/TV/" in p)
+        vid_count = sum(1 for p in saved if "/Video/" in p)
+        print(f"\nDone. {len(saved)} files saved ({tv_count} TV, {vid_count} Video), {skipped} skipped.")
+        print(f"Output: {self.output_dir}/")
+
+
+# Keep backward compatibility
+TVArchiveScraper = ArchiveScraper

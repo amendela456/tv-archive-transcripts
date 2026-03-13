@@ -1,3 +1,3 @@
-from .scraper import TVArchiveScraper
+from .scraper import ArchiveScraper, TVArchiveScraper
 
-__all__ = ["TVArchiveScraper"]
+__all__ = ["ArchiveScraper", "TVArchiveScraper"]

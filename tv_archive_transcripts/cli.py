@@ -1,21 +1,25 @@
 import argparse
 import sys
 
-from .scraper import TVArchiveScraper
+from .scraper import ArchiveScraper
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Download TV News Archive transcripts for a politician."
+        description="Download transcripts from Internet Archive TV News and Video collections."
     )
-    parser.add_argument("name", help='Politician name to search (e.g. "Bernie Sanders")')
+    parser.add_argument("name", help='Name to search (e.g. "Eli Crane")')
     parser.add_argument(
         "-n", "--max-results", type=int, default=None,
-        help="Maximum number of transcripts to download (default: all)"
+        help="Maximum number of items to download (default: all)"
     )
     parser.add_argument(
         "-o", "--output-dir", default=None,
         help='Output directory (default: "{name} TV archive transcripts")'
+    )
+    parser.add_argument(
+        "-s", "--source", choices=["all", "tv", "video"], default="all",
+        help='Which collections to search: "all", "tv", or "video" (default: all)'
     )
     parser.add_argument(
         "--rows", type=int, default=50,
@@ -32,20 +36,18 @@ def main():
 
     args = parser.parse_args()
 
-    scraper = TVArchiveScraper(
+    scraper = ArchiveScraper(
         name=args.name,
         output_dir=args.output_dir,
         rows=args.rows,
         sort=args.sort,
     )
 
-    num_found, _ = scraper.search()
-    print(f'Found {num_found} results for "{args.name}"')
-
-    if num_found == 0:
-        sys.exit(0)
-
-    scraper.download_all(max_results=args.max_results, delay=args.delay)
+    scraper.download_all(
+        source=args.source,
+        max_results=args.max_results,
+        delay=args.delay,
+    )
 
 
 if __name__ == "__main__":
