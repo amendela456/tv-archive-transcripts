@@ -15,19 +15,21 @@ DOWNLOAD_URL = "https://archive.org/download"
 class ArchiveScraper:
     """Pull transcripts from the Internet Archive TV News Archive and Video collections."""
 
-    def __init__(self, name, output_dir=None, rows=50, sort="date desc",
+    def __init__(self, name, output_dir=None, parent_dir="TV Archive phase 2",
+                 rows=50, sort="date desc",
                  download_videos=False, max_video_mb=500):
         """
         Args:
             name: Name to search for (e.g. "Eli Crane").
-            output_dir: Override output folder. Defaults to "{name} TV archive transcripts".
+            output_dir: Override output folder. Defaults to "{parent_dir}/{name} TV Archive".
+            parent_dir: Overarching folder for all targets. Defaults to "TV Archive phase 2".
             rows: Max number of results per search page.
             sort: Sort order for results.
             download_videos: Use yt-dlp to download video files for non-TV items.
             max_video_mb: Skip video downloads larger than this (MB). 0 = no limit.
         """
         self.name = name
-        self.output_dir = output_dir or f"{name} TV archive transcripts"
+        self.output_dir = output_dir or os.path.join(parent_dir, f"{name} TV Archive")
         self.rows = rows
         self.sort = sort
         self.download_videos = download_videos
@@ -352,6 +354,19 @@ class ArchiveScraper:
                         print(f"  Saved: TV/{out_name}")
                         saved.append(out_path)
 
+                        # Save JSON metadata
+                        meta_name = f"{date}_{safe_title}_metadata.json"
+                        meta_path = os.path.join(tv_dir, meta_name)
+                        with open(meta_path, "w", encoding="utf-8") as f:
+                            json.dump({
+                                "identifier": identifier,
+                                "title": title,
+                                "date": date,
+                                "type": "tv",
+                                "archive_url": f"https://archive.org/details/{identifier}",
+                                "collection": doc.get("collection", []),
+                            }, f, indent=2)
+
                     else:
                         # Always save the description/metadata text file
                         text, meta = self._extract_video_transcript(identifier)
@@ -379,6 +394,22 @@ class ArchiveScraper:
                                 f.write(content)
                             print(f"  Saved: Video/{out_name}")
                             saved.append(out_path)
+
+                        # Save JSON metadata
+                        video_meta_obj = {
+                            "identifier": identifier,
+                            "title": title,
+                            "date": date,
+                            "type": "video",
+                            "archive_url": f"https://archive.org/details/{identifier}",
+                            "collection": doc.get("collection", []),
+                        }
+                        if meta:
+                            video_meta_obj.update(meta)
+                        meta_name = f"{date}_{safe_title}_metadata.json"
+                        meta_path = os.path.join(video_dir, meta_name)
+                        with open(meta_path, "w", encoding="utf-8") as f:
+                            json.dump(video_meta_obj, f, indent=2)
 
                         # Download the actual video file if requested
                         if self.download_videos and self._ytdlp_available():

@@ -15,7 +15,11 @@ def main():
     )
     parser.add_argument(
         "-o", "--output-dir", default=None,
-        help='Output directory (default: "{name} TV archive transcripts")'
+        help='Output directory (default: "{parent_dir}/{name} TV Archive")'
+    )
+    parser.add_argument(
+        "--parent-dir", default="TV Archive phase 2",
+        help='Overarching parent folder (default: "TV Archive phase 2")'
     )
     parser.add_argument(
         "-s", "--source", choices=["all", "tv", "video"], default="all",
@@ -47,6 +51,7 @@ def main():
     scraper = ArchiveScraper(
         name=args.name,
         output_dir=args.output_dir,
+        parent_dir=args.parent_dir,
         rows=args.rows,
         sort=args.sort,
         download_videos=args.download_videos,
